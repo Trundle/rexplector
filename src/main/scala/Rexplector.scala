@@ -2,7 +2,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 
 import com.sun.jdi._
-import com.sun.jdi.event.{Event, MethodEntryEvent, VMDeathEvent, VMStartEvent}
+import com.sun.jdi.event._
 import com.sun.jdi.request.EventRequest
 import io.circe.generic.auto._
 import io.circe.syntax._
@@ -12,9 +12,14 @@ import scala.io.Source
 
 object Rexplector {
 
-    val pattern = "a?a?a?a?a?a?a?a?a?a?aaaaaaaaaa"
-    val input = "aaaaaaaaaa"
+    val pattern = "(ab)+a"
+    val input = "ababa"
     val tracer = new Tracer()
+    var previousCursor: Int = 0
+    var realPattern: String = _
+    // Fields of Pattern (during compilation)
+    var cursorField: Field = _
+    var tempField: Field = _
 
     def main(args: Array[String]): Unit = {
         val launchingConnector = Bootstrap.virtualMachineManager().defaultConnector()
@@ -66,18 +71,72 @@ object Rexplector {
         }
     }
 
+    // XXX bad name dump
     private[this] def dump(thread: ThreadReference, method: Method): Unit = {
-        if (method.name() == "match") {
-            val topframe = thread.frame(0)
-            val args = topframe.getArgumentValues
-            if (args.size() == 3) {
-                val pos = args.get(1).asInstanceOf[IntegerValue].value()
-                val seq = args.get(2).asInstanceOf[StringReference].value()
-                tracer.step(thread.frame(1).thisObject().uniqueID(),
-                            (topframe.thisObject().uniqueID(), shortName(method.declaringType().name())),
-                            pos)
-            }
+        method.name() match {
+            case "match" =>
+                val topframe = thread.frame(0)
+                val args = topframe.getArgumentValues
+                if (args.size() == 3) {
+                    val pos = args.get(1).asInstanceOf[IntegerValue].value()
+                    tracer.step(thread.frame(1).thisObject().uniqueID(),
+                                topframe.thisObject().uniqueID(),
+                                pos)
+                }
+            case "<init>" =>
+                // Node is the base class, hence if we look only at Node's constructor and not at the constructors
+                // of the derived classes, we should see every Node instance exactly once, even from derived classes
+                method.declaringType().name() match {
+                    case "java.util.regex.Pattern$Node" =>
+                        findPattern(thread) match {
+                            case Some(pattern) =>
+                                traceNode(thread, pattern)
+                                if (realPattern == null) {
+                                    realPattern = extractPattern(pattern, 0)
+                                }
+                            case None => traceStaticNode(thread, method)
+                        }
+                    case "java.util.regex.Matcher" =>
+                        tracer.node(thread.frame(0).thisObject().uniqueID(), "Matcher", pattern)
+                    case _ =>
+                }
+            case "compile" =>
+                cursorField = method.declaringType().fieldByName("cursor")
+                tempField = method.declaringType().fieldByName("temp")
+            case _ =>
         }
+    }
+
+    private[this] def traceNode(thread: ThreadReference, pattern: ObjectReference): Unit = {
+        val currentCursor = pattern.getValue(cursorField).asInstanceOf[IntegerValue].value()
+        val nodeObj = thread.frame(0).thisObject()
+        val nodePattern = extractPattern(pattern, previousCursor, Some(currentCursor))
+        tracer.node(nodeObj.uniqueID(), shortName(nodeObj.referenceType().name()), nodePattern,
+                    Some((previousCursor, currentCursor)))
+        previousCursor = currentCursor
+    }
+
+    private[this] def traceStaticNode(thread: ThreadReference, method: Method): Unit = {
+        val nodeObj = thread.frame(0).thisObject()
+        tracer.node(nodeObj.uniqueID(), shortName(nodeObj.referenceType().name()),
+                    method.location().toString)
+    }
+
+    private[this] def extractPattern(pattern: ObjectReference, from: Int, to: Option[Int] = None): String = {
+        val temp = pattern.getValue(tempField).asInstanceOf[ArrayReference]
+        val nodePatternPoints = new Array[Int](to.getOrElse(temp.length()) - from)
+        for (i <- 0 until nodePatternPoints.length) {
+            nodePatternPoints(i) = temp.getValue(from + i).asInstanceOf[IntegerValue].value()
+        }
+        new String(nodePatternPoints, 0, nodePatternPoints.length)
+    }
+
+    private[this] def findPattern(thread: ThreadReference): Option[ObjectReference] = {
+        (0 until thread.frameCount())
+            .map(thread.frame(_).thisObject())
+            .filter(_ != null)
+            .filter(_.referenceType().name() == "java.util.regex.Pattern")
+            .headOption
     }
 
     private[this] def shortName(name: String): String = {
@@ -88,11 +147,19 @@ object Rexplector {
     }
 
     private[this] def writeReport(): Unit = {
-        case class Node(id: Long, label: String)
+        case class GraphNode(id: Long, label: String)
         case class Edge(from: Long, to: Long, id: String, arrows: String = "to", selectionWidth: Int = 5)
         case class Step(from: Long, to: Long, pos: Int)
+        case class PatternPart(from: Int, to: Int)
 
-        val nodes = tracer.names.map(Node.tupled).asJson
+        val connectedNodes = tracer.edges.map { case (from, to) => Set(from, to) }.flatten.toSet[Long]
+        val usedNodes = tracer.nodes.filterKeys(connectedNodes.contains)
+        val graphNodes = usedNodes.map { case (id, (label, _)) => GraphNode(id, label) }.asJson
+        val parts = usedNodes
+            .filter { case (_, (_, pos)) => pos.isDefined }
+            .map { case (id, (_, Some(pos))) => (id, PatternPart(pos._1, pos._2)) }
+            .toMap[Long, PatternPart]
+            .asJson
         val edges = tracer.edges.map { case (from, to) => Edge(from, to, s"$from-$to") }.distinct.asJson
         val steps = tracer.steps.map { case (pos, (from, to)) => Step(from, to, pos) }.asJson
         val output =
@@ -117,32 +184,57 @@ object Rexplector {
                |
                |<div id="mynetwork"></div>
                |<input type="range" min="1" max="${tracer.steps.size}" value="1" id="stepper" />
-               |<p>$pattern </p>
+               |<p id="pattern"></p>
                |<p id="inp"></p>
                |
                |<script type="text/javascript">
-               |  var nodes = new vis.DataSet($nodes);
+               |  var nodes = new vis.DataSet($graphNodes);
                |  var edges = new vis.DataSet($edges);
                |  var steps = $steps;
                |  var input = ${input.asJson};
+               |  var pattern = ${realPattern.asJson};
+               |  var parts = $parts;
                |
                |  var container = document.getElementById('mynetwork');
                |  var data = {
                |    nodes: nodes,
                |    edges: edges
                |  };
-               |  var options = {
-               |  };
+               |  var options = {};
                |  var network = new vis.Network(container, data, options);
                |
                |  var inpElement = document.getElementById('inp');
+               |  var patternElement = document.getElementById('pattern');
                |
                |  document.getElementById('stepper').addEventListener('change', function (event) {
-               |    var step = steps[event.target.value - 1];
-               |    network.setSelection({nodes: [step.from], edges: [step.from + "-" + step.to]},
-               |                         {highlightEdges: false });
-               |    inpElement.innerHTML = input.substring(0, step.pos) + "<b>" + input.substring(step.pos, step.pos + 1) + "</b>" + input.substring(step.pos + 1);
+               |    var stepNumber = event.target.value - 1;
+               |    if (stepNumber >= 0) {
+               |      setStep(stepNumber);
+               |    }
                |  });
+               |
+               |  function setStep(stepNumber) {
+               |    var step = steps[stepNumber];
+               |    network.setSelection({nodes: [step.to], edges: [step.from + "-" + step.to]},
+               |                         {highlightEdges: false});
+               |    inpElement.innerHTML = highlight(input, "|", "", step.pos, step.pos + 1);
+               |    var part = parts[step.to];
+               |    if (part) {
+               |      patternElement.innerHTML = highlight(pattern, "<b>", "</b>", part.from, part.to);
+               |    } else {
+               |      patternElement.innerHTML = pattern;
+               |    }
+               |  }
+               |
+               |  function highlight(value, opening, closing, from, to) {
+               |      return (
+               |        value.substring(0, from)
+               |        + opening + value.substring(from, to) + closing
+               |        + value.substring(to)
+               |      );
+               |  }
+               |
+               |  setStep(0);
                |</script>
                |</body>
                |</html>
@@ -155,13 +247,16 @@ object Rexplector {
 
 class Tracer {
 
-    val names: mutable.Map[Long, String] = mutable.Map()
+    val nodes: mutable.Map[Long, (String, Option[(Int, Int)])] = mutable.Map()
     var edges: Seq[(Long, Long)] = Seq()
     var steps: Seq[(Int, (Long, Long))] = Seq()
 
-    def step(from: Long, to: (Long, String), pos: Int): Unit = {
-        names(to._1) = to._2
-        edges = edges :+ (from, to._1)
-        steps = steps :+ (pos, (from, to._1))
+    def node(id: Long, name: String, pattern: String, part: Option[(Int, Int)] = None): Unit = {
+        nodes(id) = (s"$name ($pattern)", part)
+    }
+
+    def step(from: Long, to: Long, pos: Int): Unit = {
+        edges = edges :+ (from, to)
+        steps = steps :+ (pos, (from, to))
     }
 }

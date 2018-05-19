@@ -1,5 +1,6 @@
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
+import java.util.concurrent.TimeUnit
 
 import com.sun.jdi._
 import com.sun.jdi.event._
@@ -7,15 +8,16 @@ import com.sun.jdi.request.EventRequest
 import io.circe.generic.auto._
 import io.circe.syntax._
 
+import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.io.Source
 
 object Rexplector {
 
-    val pattern = "(ab)+a"
-    val input = "ababa"
+    val pattern = "(1*)*"
+    val input = "11111."
     val tracer = new Tracer()
-    var previousCursor: Int = 0
+    var previousCursors: List[Int] = List(0, 0)
     var realPattern: String = _
     // Fields of Pattern (during compilation)
     var cursorField: Field = _
@@ -24,7 +26,7 @@ object Rexplector {
     def main(args: Array[String]): Unit = {
         val launchingConnector = Bootstrap.virtualMachineManager().defaultConnector()
         val args = launchingConnector.defaultArguments()
-        args.get("main").setValue(s"Runner ${quote(pattern)} $input")
+        args.get("main").setValue(s"Runner ${quote(pattern)} ${quote(input)}")
         args.get("suspend").setValue("true")
         args.get("options").setValue("-cp /tmp")
         val vm = launchingConnector.launch(args)
@@ -32,13 +34,15 @@ object Rexplector {
         breakOnMethodEntry(vm)
 
         var exit = false
-        while (!exit) {
+        val started = System.nanoTime()
+        while (!exit && TimeUnit.NANOSECONDS.toMinutes(System.nanoTime() - started) < 3) {
             val eventSet = vm.eventQueue().remove()
             val iter = eventSet.iterator()
             while (iter.hasNext) {
                 exit = handleEvent(iter.next())
             }
         }
+        println(s"Traced ${tracer.steps.size} steps")
 
         writeReport()
     }
@@ -58,11 +62,12 @@ object Rexplector {
                 event.virtualMachine().resume()
                 false
             case _: VMDeathEvent =>
+                println("VM dead!")
                 val errorStream = event.virtualMachine().process().getErrorStream
                 println(Source.createBufferedSource(errorStream).mkString)
                 true
             case methodEntryEvent: MethodEntryEvent =>
-                dump(methodEntryEvent.thread(), methodEntryEvent.method())
+                trace(methodEntryEvent.thread(), methodEntryEvent.method())
                 methodEntryEvent.thread().resume()
                 false
             case _ =>
@@ -71,8 +76,7 @@ object Rexplector {
         }
     }
 
-    // XXX bad name dump
-    private[this] def dump(thread: ThreadReference, method: Method): Unit = {
+    private[this] def trace(thread: ThreadReference, method: Method): Unit = {
         method.name() match {
             case "match" =>
                 val topframe = thread.frame(0)
@@ -110,10 +114,32 @@ object Rexplector {
     private[this] def traceNode(thread: ThreadReference, pattern: ObjectReference): Unit = {
         val currentCursor = pattern.getValue(cursorField).asInstanceOf[IntegerValue].value()
         val nodeObj = thread.frame(0).thisObject()
-        val nodePattern = extractPattern(pattern, previousCursor, Some(currentCursor))
+        var startCursor = previousCursors.head
+        if (startCursor == currentCursor) {
+            startCursor = previousCursors.tail.head
+        }
+        if (startCursor == currentCursor) {
+            // Oh noes, apparently the node doesn't use the pattern at all. It's probably some optimization
+            // (such as GroupCurly) where created nodes get replaced by other nodes. Assume that all node
+            // objects passed as constructor arguments will be used and therefore use the minimal cursor
+            // position of all arguments as previous cursor position
+            val starts = findOutermostInit(thread)
+                .getArgumentValues.asScala
+                .filter(_.isInstanceOf[ObjectReference])
+                .map(_.asInstanceOf[ObjectReference])
+                .flatMap(obj => tracer.nodes.get(obj.uniqueID()))
+                .flatMap { case (_, pos) => pos }
+                .map(_._1)
+            if (starts.nonEmpty) {
+                startCursor = starts.min
+            }
+        }
+        val nodePattern = extractPattern(pattern, startCursor, Some(currentCursor))
         tracer.node(nodeObj.uniqueID(), shortName(nodeObj.referenceType().name()), nodePattern,
-                    Some((previousCursor, currentCursor)))
-        previousCursor = currentCursor
+                    Some((startCursor, currentCursor)))
+        if (currentCursor != previousCursors.head) {
+            previousCursors = List(currentCursor, previousCursors.head)
+        }
     }
 
     private[this] def traceStaticNode(thread: ThreadReference, method: Method): Unit = {
@@ -125,7 +151,7 @@ object Rexplector {
     private[this] def extractPattern(pattern: ObjectReference, from: Int, to: Option[Int] = None): String = {
         val temp = pattern.getValue(tempField).asInstanceOf[ArrayReference]
         val nodePatternPoints = new Array[Int](to.getOrElse(temp.length()) - from)
-        for (i <- 0 until nodePatternPoints.length) {
+        for (i <- nodePatternPoints.indices) {
             nodePatternPoints(i) = temp.getValue(from + i).asInstanceOf[IntegerValue].value()
         }
         new String(nodePatternPoints, 0, nodePatternPoints.length)
@@ -135,8 +161,14 @@ object Rexplector {
         (0 until thread.frameCount())
             .map(thread.frame(_).thisObject())
             .filter(_ != null)
-            .filter(_.referenceType().name() == "java.util.regex.Pattern")
-            .headOption
+            .find(_.referenceType().name() == "java.util.regex.Pattern")
+    }
+
+    private[this] def findOutermostInit(thread: ThreadReference): StackFrame = {
+        (1 until thread.frameCount())
+            .map(thread.frame)
+            .takeWhile(frame => frame.location().method().name() == "<init>")
+            .last
     }
 
     private[this] def shortName(name: String): String = {
@@ -152,7 +184,7 @@ object Rexplector {
         case class Step(from: Long, to: Long, pos: Int)
         case class PatternPart(from: Int, to: Int)
 
-        val connectedNodes = tracer.edges.map { case (from, to) => Set(from, to) }.flatten.toSet[Long]
+        val connectedNodes = tracer.edges.flatMap { case (from, to) => Set(from, to) }.toSet[Long]
         val usedNodes = tracer.nodes.filterKeys(connectedNodes.contains)
         val graphNodes = usedNodes.map { case (id, (label, _)) => GraphNode(id, label) }.asJson
         val parts = usedNodes
@@ -162,12 +194,21 @@ object Rexplector {
             .asJson
         val edges = tracer.edges.map { case (from, to) => Edge(from, to, s"$from-$to") }.distinct.asJson
         val steps = tracer.steps.map { case (pos, (from, to)) => Step(from, to, pos) }.asJson
+        val topNodes = tracer.steps
+            .groupBy { case (_, (from, _)) => from }
+            .mapValues(_.size)
+            .toSeq.sortBy(_._2).reverse
+            .take(25)
+            .map { case (id, timesUsed) =>
+                s"""<a href="#" onclick="setNode(event, ${id.asJson})">$timesUsed</a>"""
+                 }
+            .mkString("\n")
         val output =
             s"""
                |<!doctype html>
                |<html>
                |<head>
-               |  <title>Network | Basic usage</title>
+               |  <title>$realPattern matches $input</title>
                |
                |  <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.js"></script>
                |  <link href="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.css" rel="stylesheet" type="text/css" />
@@ -186,41 +227,45 @@ object Rexplector {
                |<input type="range" min="1" max="${tracer.steps.size}" value="1" id="stepper" />
                |<p id="pattern"></p>
                |<p id="inp"></p>
+               |$topNodes
                |
                |<script type="text/javascript">
-               |  var nodes = new vis.DataSet($graphNodes);
-               |  var edges = new vis.DataSet($edges);
-               |  var steps = $steps;
-               |  var input = ${input.asJson};
-               |  var pattern = ${realPattern.asJson};
-               |  var parts = $parts;
+               |  const nodes = new vis.DataSet($graphNodes);
+               |  const edges = new vis.DataSet($edges);
+               |  const steps = $steps;
+               |  const input = ${input.asJson};
+               |  const pattern = ${realPattern.asJson};
+               |  const parts = $parts;
                |
-               |  var container = document.getElementById('mynetwork');
-               |  var data = {
+               |  const container = document.getElementById('mynetwork');
+               |  const data = {
                |    nodes: nodes,
                |    edges: edges
                |  };
-               |  var options = {};
-               |  var network = new vis.Network(container, data, options);
+               |  const network = new vis.Network(container, data, {});
                |
-               |  var inpElement = document.getElementById('inp');
-               |  var patternElement = document.getElementById('pattern');
+               |  const inpElement = document.getElementById('inp');
+               |  const patternElement = document.getElementById('pattern');
                |
                |  document.getElementById('stepper').addEventListener('change', function (event) {
-               |    var stepNumber = event.target.value - 1;
+               |    const stepNumber = event.target.value - 1;
                |    if (stepNumber >= 0) {
                |      setStep(stepNumber);
                |    }
                |  });
                |
                |  function setStep(stepNumber) {
-               |    var step = steps[stepNumber];
+               |    const step = steps[stepNumber];
                |    network.setSelection({nodes: [step.to], edges: [step.from + "-" + step.to]},
                |                         {highlightEdges: false});
                |    inpElement.innerHTML = highlight(input, "|", "", step.pos, step.pos + 1);
-               |    var part = parts[step.to];
+               |    setPattern(step.to);
+               |  }
+               |
+               |  function setPattern(nodeId) {
+               |    const part = parts[nodeId];
                |    if (part) {
-               |      patternElement.innerHTML = highlight(pattern, "<b>", "</b>", part.from, part.to);
+               |      patternElement.innerHTML = highlight(pattern, '<span style="color:red;">', "</span>", part.from, part.to);
                |    } else {
                |      patternElement.innerHTML = pattern;
                |    }
@@ -232,6 +277,12 @@ object Rexplector {
                |        + opening + value.substring(from, to) + closing
                |        + value.substring(to)
                |      );
+               |  }
+               |
+               |  function setNode(event, id) {
+               |    network.selectNodes([id], false);
+               |    setPattern(id);
+               |    event.preventDefault();
                |  }
                |
                |  setStep(0);
@@ -252,7 +303,12 @@ class Tracer {
     var steps: Seq[(Int, (Long, Long))] = Seq()
 
     def node(id: Long, name: String, pattern: String, part: Option[(Int, Int)] = None): Unit = {
-        nodes(id) = (s"$name ($pattern)", part)
+        var shortened = if (pattern.length > 10) {
+            pattern.substring(0, 10) + "…"
+        } else {
+            pattern
+        }
+        nodes(id) = (s"$name ($shortened)", part)
     }
 
     def step(from: Long, to: Long, pos: Int): Unit = {

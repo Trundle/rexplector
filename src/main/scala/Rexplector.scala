@@ -8,7 +8,6 @@ import com.sun.jdi.request.EventRequest
 import io.circe.generic.auto._
 import io.circe.syntax._
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.io.Source
 
@@ -118,22 +117,6 @@ object Rexplector {
         if (startCursor == currentCursor) {
             startCursor = previousCursors.tail.head
         }
-        if (startCursor == currentCursor) {
-            // Oh noes, apparently the node doesn't use the pattern at all. It's probably some optimization
-            // (such as GroupCurly) where created nodes get replaced by other nodes. Assume that all node
-            // objects passed as constructor arguments will be used and therefore use the minimal cursor
-            // position of all arguments as previous cursor position
-            val starts = findOutermostInit(thread)
-                .getArgumentValues.asScala
-                .filter(_.isInstanceOf[ObjectReference])
-                .map(_.asInstanceOf[ObjectReference])
-                .flatMap(obj => tracer.nodes.get(obj.uniqueID()))
-                .flatMap { case (_, pos) => pos }
-                .map(_._1)
-            if (starts.nonEmpty) {
-                startCursor = starts.min
-            }
-        }
         val nodePattern = extractPattern(pattern, startCursor, Some(currentCursor))
         tracer.node(nodeObj.uniqueID(), shortName(nodeObj.referenceType().name()), nodePattern,
                     Some((startCursor, currentCursor)))
@@ -162,13 +145,6 @@ object Rexplector {
             .map(thread.frame(_).thisObject())
             .filter(_ != null)
             .find(_.referenceType().name() == "java.util.regex.Pattern")
-    }
-
-    private[this] def findOutermostInit(thread: ThreadReference): StackFrame = {
-        (1 until thread.frameCount())
-            .map(thread.frame)
-            .takeWhile(frame => frame.location().method().name() == "<init>")
-            .last
     }
 
     private[this] def shortName(name: String): String = {

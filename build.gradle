@@ -1,0 +1,22 @@
+plugins {
+    id 'application'
+    id 'scala'
+}
+
+sourceCompatibility = "1.8"
+targetCompatibility = "1.8"
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compile 'org.scala-lang:scala-library:2.12.6'
+    compile 'io.circe:circe-generic_2.12:0.9.3'
+}
+
+run {
+    args(sourceSets.main.java.outputDir)
+}
+
+mainClassName = "Rexplector"

@@ -24,11 +24,11 @@ object Rexplector {
 
     def main(args: Array[String]): Unit = {
         val launchingConnector = Bootstrap.virtualMachineManager().defaultConnector()
-        val args = launchingConnector.defaultArguments()
-        args.get("main").setValue(s"Runner ${quote(pattern)} ${quote(input)}")
-        args.get("suspend").setValue("true")
-        args.get("options").setValue("-cp /tmp")
-        val vm = launchingConnector.launch(args)
+        val connectorArgs = launchingConnector.defaultArguments()
+        connectorArgs.get("main").setValue(s"Runner ${quote(pattern)} ${quote(input)}")
+        connectorArgs.get("suspend").setValue("true")
+        connectorArgs.get("options").setValue(s"-cp ${quote(args(0))}")
+        val vm = launchingConnector.launch(connectorArgs)
 
         breakOnMethodEntry(vm)
 
@@ -267,7 +267,7 @@ object Rexplector {
                |</html>
                |
          """.stripMargin
-        Files.write(Paths.get("/tmp/spam.html"), output.getBytes(StandardCharsets.UTF_8))
+        Files.write(Paths.get("report.html"), output.getBytes(StandardCharsets.UTF_8))
     }
 }
 

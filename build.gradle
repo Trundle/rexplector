@@ -1,3 +1,5 @@
+import org.gradle.internal.jvm.Jvm
+
 plugins {
     id 'application'
     id 'scala'
@@ -13,6 +15,10 @@ repositories {
 dependencies {
     compile 'org.scala-lang:scala-library:2.12.6'
     compile 'io.circe:circe-generic_2.12:0.9.3'
+
+    if (Jvm.current().toolsJar) {
+        compile files(Jvm.current().toolsJar)
+    }
 }
 
 run {
